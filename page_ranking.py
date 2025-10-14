@@ -1,5 +1,6 @@
 from mpi4py import MPI
 from collections import defaultdict
+import os
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -29,34 +30,32 @@ def distribute_edges(edges):
 def build_local_graph(local_edges):
     out_counts = defaultdict(int)
     in_links = defaultdict(list)
-    
     for src, dst in local_edges:
         out_counts[src] += 1
         in_links[dst].append(src)
-    
     return out_counts, in_links
 
 
 def gather_and_merge(out_counts, in_links):
     all_out_counts = comm.gather(out_counts, root=0)
     all_in_links = comm.gather(in_links, root=0)
-    
+
     if rank == 0:
         merged_out = defaultdict(int)
         merged_in = defaultdict(list)
-        
+
         for d in all_out_counts:
             for k, v in d.items():
                 merged_out[k] += v
-        
+
         for d in all_in_links:
             for k, v in d.items():
                 merged_in[k].extend(v)
-        
+
         nodes = set(merged_out.keys()).union(merged_in.keys())
         N = len(nodes)
         pagerank = {node: 1 / N for node in nodes}
-        
+
         return merged_out, merged_in, pagerank, N
     else:
         return None, None, None, None
@@ -73,37 +72,47 @@ def broadcast_graph_data(merged_out, merged_in, pagerank, N):
 def compute_pagerank_iteration(pagerank, merged_in, merged_out, N, beta=0.9):
     local_contribs = defaultdict(float)
     my_nodes = list(pagerank.keys())[rank::size]
-    
+
     for node in my_nodes:
         total = 0
-        
         if node in merged_in:
             for src in merged_in[node]:
                 if merged_out[src] > 0:
                     total += pagerank[src] / merged_out[src]
-        
         local_contribs[node] = (1 - beta) / N + beta * total
-    
+
     return local_contribs
 
 
 def gather_and_update_pagerank(local_contribs, pagerank):
     all_contribs = comm.gather(local_contribs, root=0)
-    
+
     if rank == 0:
         new_pagerank = pagerank.copy()
         for d in all_contribs:
             for k, v in d.items():
                 new_pagerank[k] = v
         pagerank = new_pagerank
-    
+
     return comm.bcast(pagerank, root=0)
 
 
-def run_pagerank_iterations(pagerank, merged_in, merged_out, N, num_iterations=4, beta=0.9):
+def save_local_contribs(local_contribs, iter_num, save_dir):
+    output_file = os.path.join(save_dir, f"iter_{iter_num}_rank_{rank}.txt")
+    with open(output_file, "w") as f:
+        for node, val in sorted(local_contribs.items()):
+            f.write(f"{node},{val:.6f}\n")
+
+
+def run_pagerank_iterations(pagerank, merged_in, merged_out, N, num_iterations=4, beta=0.9, save_dir=None):
     for it in range(num_iterations):
         local_contribs = compute_pagerank_iteration(pagerank, merged_in, merged_out, N, beta)
+
+        if save_dir is not None:
+            save_local_contribs(local_contribs, it, save_dir)
+
         pagerank = gather_and_update_pagerank(local_contribs, pagerank)
+
     return pagerank
 
 
@@ -120,17 +129,31 @@ def main():
         edges = load_edges_all_files(10)
     else:
         edges = None
-    
+
     local_edges = distribute_edges(edges)
-    
     out_counts, in_links = build_local_graph(local_edges)
-    
+
     merged_out, merged_in, pagerank, N = gather_and_merge(out_counts, in_links)
-    
     merged_out, merged_in, pagerank, N = broadcast_graph_data(merged_out, merged_in, pagerank, N)
-    
-    pagerank = run_pagerank_iterations(pagerank, merged_in, merged_out, N, num_iterations=4)
-    
+
+
+    if rank == 0:
+        save_dir = "/gpfs/projects/AMS598/class2025/Bhuma_YaswanthReddy/page_rank"
+        os.makedirs(save_dir, exist_ok=True)
+    else:
+        save_dir = None
+    save_dir = comm.bcast(save_dir, root=0)
+
+    pagerank = run_pagerank_iterations(
+        pagerank,
+        merged_in,
+        merged_out,
+        N,
+        num_iterations=4,
+        beta=0.9,
+        save_dir=save_dir
+    )
+
     write_top_results(pagerank, "/gpfs/projects/AMS598/class2025/Bhuma_YaswanthReddy/top10.txt")
 
 
