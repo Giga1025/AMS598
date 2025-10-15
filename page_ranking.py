@@ -1,174 +1,123 @@
 from mpi4py import MPI
-from collections import defaultdict
+import numpy as np
 import os
+import resource
 import time
+
+BETA = 0.9
+ITERATIONS = 4
+INPUT_DIR = '/gpfs/projects/AMS598/projects2025_data/project2_data'
+DATA_FILES = [f'data{i}.txt' for i in range(1, 11)]
+OUTPUT_DIR = '/gpfs/projects/AMS598/class2025/Bhuma_YaswanthReddy/page_rank'
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
 
-def load_edges_by_rank(rank, size, num_files=10):
-    """Each rank loads a subset of files independently to avoid 8GB load on rank 0"""
-    path = "/gpfs/projects/AMS598/projects2025_data/project2_data"
-    edges = []
-
-    for i in range(1, num_files + 1):
-        if (i - 1) % size == rank:
-            filepath = f"{path}/data{i}.txt"
-            try:
-                with open(filepath) as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            try:
-                                src, dst = map(int, line.split(","))
-                                edges.append((src, dst))
-                            except ValueError:
-                                continue
-            except FileNotFoundError:
-                continue
-
-    return edges
+def log_memory_usage():
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"[Rank {rank}] Memory usage: {rss:.2f} MB")
 
 
-def build_local_graph(local_edges):
-    out_counts = defaultdict(int)
-    in_links = defaultdict(list)
-    
-    for src, dst in local_edges:
-        out_counts[src] += 1
-        in_links[dst].append(src)
-    
-    return out_counts, in_links
+def parse_graph(directory_path, filenames):
+    adj_list = {}
+    all_pages = set()
+
+    for filename in filenames:
+        filepath = os.path.join(directory_path, filename)
+        try:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            src, dst = map(int, line.strip().split(','))
+                            adj_list.setdefault(src, []).append(dst)
+                            all_pages.update([src, dst])
+                        except ValueError:
+                            continue
+        except FileNotFoundError:
+            continue
+
+    return adj_list, sorted(list(all_pages))
 
 
-def gather_and_merge(out_counts, in_links):
-    all_out_counts = comm.gather(out_counts, root=0)
-    all_in_links = comm.gather(in_links, root=0)
-
+def scatter_pages(all_pages):
     if rank == 0:
-        merged_out = defaultdict(int)
-        merged_in = defaultdict(list)
-
-        for d in all_out_counts:
-            for k, v in d.items():
-                merged_out[k] += v
-
-        for d in all_in_links:
-            for k, v in d.items():
-                merged_in[k].extend(v)
-
-        nodes = set(merged_out.keys()).union(merged_in.keys())
-        N = len(nodes)
-        pagerank = {node: 1.0 / N for node in nodes}
-        
-        for node in nodes:
-            if node not in merged_out:
-                merged_out[node] = 0
-
-        return merged_out, merged_in, pagerank, N
+        chunks = np.array_split(all_pages, size)
     else:
-        return None, None, None, None
+        chunks = None
+    return comm.scatter(chunks, root=0)
 
 
-def broadcast_graph_data(merged_out, merged_in, pagerank, N):
-    merged_out = comm.bcast(merged_out, root=0)
-    merged_in = comm.bcast(merged_in, root=0)
-    pagerank = comm.bcast(pagerank, root=0)
-    N = comm.bcast(N, root=0)
-    return merged_out, merged_in, pagerank, N
+def compute_contributions(my_pages, adj_list, pagerank, page_to_idx, N):
+    contrib = np.zeros(N)
+    for page in my_pages:
+        if page in adj_list:
+            num_links = len(adj_list[page])
+            if num_links > 0:
+                share = pagerank[page_to_idx[page]] / num_links
+                for dst in adj_list[page]:
+                    if dst in page_to_idx:
+                        contrib[page_to_idx[dst]] += share
+    return contrib
 
 
-def compute_pagerank_iteration(pagerank, merged_in, merged_out, N, beta=0.9):
-    local_contribs = defaultdict(float)
-    all_nodes = sorted(pagerank.keys())
-    my_nodes = all_nodes[rank::size]
-    
-    for node in my_nodes:
-        incoming_rank = 0.0
-        if node in merged_in:
-            for src in merged_in[node]:
-                out_degree = merged_out[src]
-                if out_degree > 0:
-                    incoming_rank += pagerank[src] / out_degree
-        local_contribs[node] = (1 - beta) / N + beta * incoming_rank
-    
-    return local_contribs
+def save_contributions(contrib, iter_num):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    fname = os.path.join(OUTPUT_DIR, f'iter_{iter_num}_rank_{rank}.npy')
+    np.save(fname, contrib)
 
 
-def gather_and_update_pagerank(local_contribs):
-    all_contribs = comm.gather(local_contribs, root=0)
-
-    if rank == 0:
-        new_pagerank = {}
-        for d in all_contribs:
-            for k, v in d.items():
-                new_pagerank[k] = v
-        return new_pagerank
-    else:
-        return None
+def aggregate_contributions(iter_num, N):
+    total = np.zeros(N)
+    for r in range(size):
+        fname = os.path.join(OUTPUT_DIR, f'iter_{iter_num}_rank_{r}.npy')
+        part = np.load(fname)
+        total += part
+    return total
 
 
-def save_local_contribs(local_contribs, iter_num, save_dir):
-    output_file = os.path.join(save_dir, f"iter_{iter_num}_rank_{rank}.txt")
-    with open(output_file, "w") as f:
-        for node, val in sorted(local_contribs.items()):
-            f.write(f"{node},{val:.6f}\n")
+def print_top10(all_pages, pagerank):
+    results = sorted(zip(all_pages, pagerank), key=lambda x: x[1], reverse=True)
+    print("\n--- Top 10 Webpages by PageRank ---")
+    for i in range(10):
+        page, score = results[i]
+        print(f"{i+1}. Webpage: {page}\tScore: {score:.6f}")
 
 
-def run_pagerank_iterations(pagerank, merged_in, merged_out, N, 
-                            num_iterations=4, beta=0.9, save_dir=None):
-    for it in range(num_iterations):
-        local_contribs = compute_pagerank_iteration(pagerank, merged_in, merged_out, N, beta)
-        
-        if save_dir is not None:
-            save_local_contribs(local_contribs, it, save_dir)
-        
-        new_pagerank = gather_and_update_pagerank(local_contribs)
-        pagerank = comm.bcast(new_pagerank, root=0)
-    
-    return pagerank
-
-
-def write_top_results(pagerank, output_path, top_n=10):
-    if rank == 0:
-        top_nodes = sorted(pagerank.items(), key=lambda x: x[1], reverse=True)[:top_n]
-        with open(output_path, "w") as f:
-            for node, pr in top_nodes:
-                f.write(f"{node},{pr:.6f}\n")
-
-
-def main():
+def run_pagerank():
     start_time = time.time()
 
-    local_edges = load_edges_by_rank(rank, size, num_files=10)
-    out_counts, in_links = build_local_graph(local_edges)
-    merged_out, merged_in, pagerank, N = gather_and_merge(out_counts, in_links)
-    merged_out, merged_in, pagerank, N = broadcast_graph_data(merged_out, merged_in, pagerank, N)
+    if rank == 0:
+        print("[Rank 0] Parsing graph...")
+    adj_list, all_pages = parse_graph(INPUT_DIR, DATA_FILES)
+    if not all_pages:
+        raise ValueError("No pages found.")
+
+    N = len(all_pages)
+    page_to_idx = {page: i for i, page in enumerate(all_pages)}
+    pagerank = np.full(N, 1.0 / N)
+
+    my_pages = scatter_pages(all_pages)
+
+    log_memory_usage()
+
+    for i in range(ITERATIONS):
+        local_contrib = compute_contributions(my_pages, adj_list, pagerank, page_to_idx, N)
+        save_contributions(local_contrib, i)
+
+        comm.barrier()
+
+        if rank == 0:
+            total_contrib = aggregate_contributions(i, N)
+            pagerank = (1 - BETA) / N + BETA * total_contrib
+        pagerank = comm.bcast(pagerank, root=0)
 
     if rank == 0:
-        save_dir = "/gpfs/projects/AMS598/class2025/Bhuma_YaswanthReddy/page_rank"
-        os.makedirs(save_dir, exist_ok=True)
-    else:
-        save_dir = None
-    save_dir = comm.bcast(save_dir, root=0)
-
-    pagerank = run_pagerank_iterations(
-        pagerank,
-        merged_in,
-        merged_out,
-        N,
-        num_iterations=4,
-        beta=0.9,
-        save_dir=save_dir
-    )
-
-    write_top_results(pagerank, "/gpfs/projects/AMS598/class2025/Bhuma_YaswanthReddy/top10.txt")
-
-    if rank == 0:
-        print(f"[Rank 0] Total execution time: {time.time() - start_time:.2f} seconds")
+        print_top10(all_pages, pagerank)
+        print(f"\n[Rank 0] Finished in {time.time() - start_time:.2f} seconds")
 
 
 if __name__ == "__main__":
-    main()
+    run_pagerank()
