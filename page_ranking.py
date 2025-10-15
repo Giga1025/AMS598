@@ -1,55 +1,38 @@
 from mpi4py import MPI
 from collections import defaultdict
 import os
+import time
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
 
-def load_edges_all_files(num_files=10):
-    """Load all edges from data files (only called by rank 0)"""
-    all_edges = []
+def load_edges_by_rank(rank, size, num_files=10):
+    """Each rank loads a subset of files independently to avoid 8GB load on rank 0"""
     path = "/gpfs/projects/AMS598/projects2025_data/project2_data"
-    
+    edges = []
+
     for i in range(1, num_files + 1):
-        filepath = f"{path}/data{i}.txt"
-        try:
-            with open(filepath) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            src, dst = map(int, line.split(","))
-                            all_edges.append((src, dst))
-                        except ValueError:
-                            continue
-        except FileNotFoundError:
-            continue
-    
-    return all_edges
+        if (i - 1) % size == rank:
+            filepath = f"{path}/data{i}.txt"
+            try:
+                with open(filepath) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                src, dst = map(int, line.split(","))
+                                edges.append((src, dst))
+                            except ValueError:
+                                continue
+            except FileNotFoundError:
+                continue
 
-
-def distribute_edges(edges):
-    """Distribute edges evenly across all processes using MPI scatter"""
-    if rank == 0:
-        chunk_size = len(edges) // size
-        remainder = len(edges) % size
-        chunks = []
-        start = 0
-        
-        for i in range(size):
-            end = start + chunk_size + (1 if i < remainder else 0)
-            chunks.append(edges[start:end])
-            start = end
-    else:
-        chunks = None
-    
-    return comm.scatter(chunks, root=0)
+    return edges
 
 
 def build_local_graph(local_edges):
-    """Build local graph structures from assigned edges"""
     out_counts = defaultdict(int)
     in_links = defaultdict(list)
     
@@ -61,7 +44,6 @@ def build_local_graph(local_edges):
 
 
 def gather_and_merge(out_counts, in_links):
-    """Gather local graphs and merge into complete graph structure"""
     all_out_counts = comm.gather(out_counts, root=0)
     all_in_links = comm.gather(in_links, root=0)
 
@@ -91,7 +73,6 @@ def gather_and_merge(out_counts, in_links):
 
 
 def broadcast_graph_data(merged_out, merged_in, pagerank, N):
-    """Broadcast complete graph data to all processes"""
     merged_out = comm.bcast(merged_out, root=0)
     merged_in = comm.bcast(merged_in, root=0)
     pagerank = comm.bcast(pagerank, root=0)
@@ -100,7 +81,6 @@ def broadcast_graph_data(merged_out, merged_in, pagerank, N):
 
 
 def compute_pagerank_iteration(pagerank, merged_in, merged_out, N, beta=0.9):
-    """MAP phase: Compute local PageRank contributions for assigned nodes"""
     local_contribs = defaultdict(float)
     all_nodes = sorted(pagerank.keys())
     my_nodes = all_nodes[rank::size]
@@ -112,14 +92,12 @@ def compute_pagerank_iteration(pagerank, merged_in, merged_out, N, beta=0.9):
                 out_degree = merged_out[src]
                 if out_degree > 0:
                     incoming_rank += pagerank[src] / out_degree
-        
         local_contribs[node] = (1 - beta) / N + beta * incoming_rank
     
     return local_contribs
 
 
 def gather_and_update_pagerank(local_contribs):
-    """REDUCE phase: Gather all local contributions and combine into new PageRank"""
     all_contribs = comm.gather(local_contribs, root=0)
 
     if rank == 0:
@@ -133,7 +111,6 @@ def gather_and_update_pagerank(local_contribs):
 
 
 def save_local_contribs(local_contribs, iter_num, save_dir):
-    """Save intermediate results for this iteration and rank"""
     output_file = os.path.join(save_dir, f"iter_{iter_num}_rank_{rank}.txt")
     with open(output_file, "w") as f:
         for node, val in sorted(local_contribs.items()):
@@ -142,7 +119,6 @@ def save_local_contribs(local_contribs, iter_num, save_dir):
 
 def run_pagerank_iterations(pagerank, merged_in, merged_out, N, 
                             num_iterations=4, beta=0.9, save_dir=None):
-    """Run specified number of PageRank iterations with map/reduce pattern"""
     for it in range(num_iterations):
         local_contribs = compute_pagerank_iteration(pagerank, merged_in, merged_out, N, beta)
         
@@ -156,7 +132,6 @@ def run_pagerank_iterations(pagerank, merged_in, merged_out, N,
 
 
 def write_top_results(pagerank, output_path, top_n=10):
-    """Write top N pages by PageRank to output file"""
     if rank == 0:
         top_nodes = sorted(pagerank.items(), key=lambda x: x[1], reverse=True)[:top_n]
         with open(output_path, "w") as f:
@@ -165,13 +140,9 @@ def write_top_results(pagerank, output_path, top_n=10):
 
 
 def main():
-    """Main execution function"""
-    if rank == 0:
-        edges = load_edges_all_files(10)
-    else:
-        edges = None
+    start_time = time.time()
 
-    local_edges = distribute_edges(edges)
+    local_edges = load_edges_by_rank(rank, size, num_files=10)
     out_counts, in_links = build_local_graph(local_edges)
     merged_out, merged_in, pagerank, N = gather_and_merge(out_counts, in_links)
     merged_out, merged_in, pagerank, N = broadcast_graph_data(merged_out, merged_in, pagerank, N)
@@ -194,6 +165,9 @@ def main():
     )
 
     write_top_results(pagerank, "/gpfs/projects/AMS598/class2025/Bhuma_YaswanthReddy/top10.txt")
+
+    if rank == 0:
+        print(f"[Rank 0] Total execution time: {time.time() - start_time:.2f} seconds")
 
 
 if __name__ == "__main__":
