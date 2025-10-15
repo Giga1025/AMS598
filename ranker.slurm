@@ -13,4 +13,4 @@ module load python/3.11.2
 module load mvapich2/gcc/64/2.2rc1
 module load mpi4py/latest
 
-mpirun -np 5 python3 /gpfs/home/ybhuma/AMS598/page_ranking.py
+srun python3 /gpfs/home/ybhuma/AMS598/page_ranking.py
